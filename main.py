@@ -3,202 +3,121 @@ import typing
 import joblib
 import pandas as pd
 import numpy as np
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
-from torch.nn.utils.rnn import pad_sequence
-from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split
-import optuna
+import scipy.stats
+import lightgbm as lgb
+from sklearn.model_selection import RandomizedSearchCV
+import warnings
+from scipy.stats import linregress
 
+warnings.filterwarnings('ignore', category=UserWarning)
+warnings.filterwarnings('ignore', category=RuntimeWarning)
 
-class TimeSeriesDataset(Dataset):
-    def __init__(self, sequences_before, sequences_after, labels):
-        self.sequences_before = [torch.tensor(s, dtype=torch.float32) for s in sequences_before]
-        self.sequences_after = [torch.tensor(s, dtype=torch.float32) for s in sequences_after]
-        self.labels = torch.tensor(labels, dtype=torch.float32)
-
-    def __len__(self):
-        return len(self.labels)
-
-    def __getitem__(self, idx):
-        return self.sequences_before[idx], self.sequences_after[idx], self.labels[idx]
-
-    @staticmethod
-    def collate_fn(batch):
-        seqs_before, seqs_after, labels = zip(*batch)
-        padded_before = pad_sequence(seqs_before, batch_first=True, padding_value=0.0).unsqueeze(-1)
-        padded_after = pad_sequence(seqs_after, batch_first=True, padding_value=0.0).unsqueeze(-1)
-        return padded_before, padded_after, torch.stack(labels)
-
-class SiameseLSTM(nn.Module):
-    def __init__(self, input_size, hidden_size, num_layers, dropout, bidirectional=False):
-        super().__init__()
-        self.encoder = nn.LSTM(
-            input_size, hidden_size, num_layers, 
-            batch_first=True, dropout=dropout, bidirectional=bidirectional
-        )
-        encoder_output_size = hidden_size * 2 if bidirectional else hidden_size
-        self.classifier = nn.Sequential(
-            nn.Linear(encoder_output_size * 2, hidden_size),
-            nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(hidden_size, 1),
-            nn.Sigmoid()
-        )
-
-    def forward_one(self, x):
-        _, (hidden, _) = self.encoder(x)
-        if self.encoder.bidirectional:
-            return torch.cat((hidden[-2,:,:], hidden[-1,:,:]), dim=1)
+def extract_features(series_data: pd.DataFrame) -> pd.Series:
+    period_0 = series_data[series_data['period'] == 0]['value'].dropna()
+    period_1 = series_data[series_data['period'] == 1]['value'].dropna()
+    features = {}
+    for p, prefix in [(period_0, '0'), (period_1, '1')]:
+        if not p.empty:
+            features[f'mean_{prefix}'] = p.mean()
+            features[f'std_{prefix}'] = p.std()
+            features[f'var_{prefix}'] = p.var()
+            features[f'skew_{prefix}'] = p.skew()
+            features[f'kurt_{prefix}'] = p.kurt()
+            features[f'median_{prefix}'] = p.median()
+            features[f'q25_{prefix}'] = p.quantile(0.25)
+            features[f'q75_{prefix}'] = p.quantile(0.75)
+            features[f'min_{prefix}'] = p.min()
+            features[f'max_{prefix}'] = p.max()
+            features[f'abs_mean_{prefix}'] = p.abs().mean()
+            features[f'abs_std_{prefix}'] = p.abs().std()
+            features[f'abs_max_{prefix}'] = p.abs().max()
+            features[f'autocorr_lag1_{prefix}'] = p.autocorr(lag=1)
+            features[f'autocorr_lag5_{prefix}'] = p.autocorr(lag=5)
         else:
-            return hidden[-1]
+            # Fill with zeros or NaNs if a period is empty
+            keys = ['mean', 'std', 'var', 'skew', 'kurt', 'median', 'q25', 'q75', 'min', 'max', 'abs_mean', 'abs_std', 'abs_max', 'autocorr_lag1', 'autocorr_lag5']
+            for key in keys:
+                features[f'{key}_{prefix}'] = np.nan
 
-    def forward(self, x1, x2):
-        embedding1 = self.forward_one(x1)
-        embedding2 = self.forward_one(x2)
-        combined = torch.cat((embedding1, embedding2), dim=1)
-        return self.classifier(combined)
+    if not period_0.empty and not period_1.empty:
+        features['mean_diff'] = features['mean_1'] - features['mean_0']
+        features['median_diff'] = features['median_1'] - features['median_0']
+        features['std_ratio'] = features['std_1'] / features['std_0'] if features['std_0'] > 0 else np.nan
+        features['var_ratio'] = features['var_1'] / features['var_0'] if features['var_0'] > 0 else np.nan
+        features['abs_mean_ratio'] = features['abs_mean_1'] / features['abs_mean_0'] if features['abs_mean_0'] > 0 else np.nan
+        features['autocorr_lag1_diff'] = features['autocorr_lag1_1'] - features['autocorr_lag1_0']
 
+        # T-test for mean comparison
+        ttest_stat, ttest_pvalue = scipy.stats.ttest_ind(period_0, period_1, equal_var=False)
+        features['ttest_pvalue'] = ttest_pvalue
+        features['ttest_stat'] = ttest_stat
 
-def objective(
-    trial: optuna.Trial,
-    train_loader: DataLoader,
-    val_loader: DataLoader,
-    device: torch.device
-) -> float:
-    
-    hidden_size = trial.suggest_int("hidden_size", 32, 128, step=16)
-    num_layers = trial.suggest_int("num_layers", 1, 3)
-    dropout = trial.suggest_float("dropout", 0.1, 0.5)
-    bidirectional = trial.suggest_categorical("bidirectional", [True, False])
-    learning_rate = trial.suggest_float("learning_rate", 1e-4, 1e-2, log=True)
-    
-    model = SiameseLSTM(
-        input_size=1, 
-        hidden_size=hidden_size, 
-        num_layers=num_layers, 
-        dropout=dropout,
-        bidirectional=bidirectional
-    ).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    criterion = nn.BCEWithLogitsLoss()
-    
-    NUM_EPOCHS = 10
-   
-    for epoch in range(NUM_EPOCHS):
-        model.train()
-        for before_batch, after_batch, labels_batch in train_loader:
-            before_batch, after_batch, labels_batch = before_batch.to(device), after_batch.to(device), labels_batch.to(device)
-            optimizer.zero_grad()
-            outputs = model(before_batch, after_batch)
-            loss = criterion(outputs.squeeze(), labels_batch)
-            loss.backward()
-            optimizer.step()
+        # Levene's test for variance comparison
+        levene_stat, levene_pvalue = scipy.stats.levene(period_0, period_1)
+        features['levene_pvalue'] = levene_pvalue
+        features['levene_stat'] = levene_stat
 
-    model.eval()
-    val_loss = 0
-    with torch.no_grad():
-        for before_batch, after_batch, labels_batch in val_loader:
-            before_batch, after_batch, labels_batch = before_batch.to(device), after_batch.to(device), labels_batch.to(device)
-            outputs = model(before_batch, after_batch)
-            loss = criterion(outputs.squeeze(), labels_batch)
-            val_loss += loss.item()
-
-    avg_val_loss = val_loss / len(val_loader)
-    return avg_val_loss
+    return pd.Series(features)
 
 def train(
     X_train: pd.DataFrame,
     y_train: pd.Series,
     model_directory_path: str,
-):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+): 
+    X_train_features = X_train.groupby('id', group_keys=False).apply(extract_features)
+    imputer_values = X_train_features.median().to_dict()
+    X_train_features.fillna(imputer_values, inplace=True)
+    y_train_aligned = y_train.loc[X_train_features.index]
 
-    seqs_before, seqs_after = [], []
-    grouped = X_train.groupby('id')
-    for series_id in y_train.index:
-        group = grouped.get_group(series_id)
-        seqs_before.append(group[group['period'] == 0]['value'].values.reshape(-1, 1))
-        seqs_after.append(group[group['period'] == 1]['value'].values.reshape(-1, 1))
-    labels = y_train.values.astype(float)
+    base_model = lgb.LGBMClassifier(random_state=24, class_weight='balanced')
 
-    indices = np.arange(len(labels))
-    train_indices, val_indices = train_test_split(indices, test_size=0.2, random_state=42, stratify=labels)
-    
-    seqs_before_train, seqs_after_train, labels_train = [seqs_before[i] for i in train_indices], [seqs_after[i] for i in train_indices], labels[train_indices]
-    seqs_before_val, seqs_after_val, labels_val = [seqs_before[i] for i in val_indices], [seqs_after[i] for i in val_indices], labels[val_indices]
+    param_dist = {
+        'n_estimators': [100, 200, 300, 500],
+        'learning_rate': [0.01, 0.05, 0.1],
+        'num_leaves': [20, 30, 40, 50],
+        'max_depth': [-1, 10, 20],
+        'subsample': [0.8, 0.9, 1.0],
+        'colsample_bytree': [0.8, 0.9, 1.0],
+    }
 
-    scaler = StandardScaler().fit(np.vstack([s for s in seqs_before_train if s.shape[0] > 0]))
-    
-    train_dataset = PairedTimeSeriesDataset([scaler.transform(s) for s in seqs_before_train], [scaler.transform(s) for s in seqs_after_train], labels_train)
-    val_dataset = PairedTimeSeriesDataset([scaler.transform(s) for s in seqs_before_val], [scaler.transform(s) for s in seqs_after_val], labels_val)
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, collate_fn=PairedTimeSeriesDataset.collate_fn)
-    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, collate_fn=PairedTimeSeriesDataset.collate_fn)
-
-    study = optuna.create_study(direction="minimize")
-    study.optimize(lambda trial: objective(trial, train_loader, val_loader, device), n_trials=30) 
-    best_params = study.best_trial.params
-    print("Best trial found:", best_params)
-
-    print("\nTraining final model...")
-    seqs_before_scaled = [scaler.transform(s) for s in seqs_before]
-    seqs_after_scaled = [scaler.transform(s) for s in seqs_after]
-    full_dataset = PairedTimeSeriesDataset(seqs_before_scaled, seqs_after_scaled, labels)
-    full_loader = DataLoader(full_dataset, batch_size=32, shuffle=True, collate_fn=PairedTimeSeriesDataset.collate_fn)
-
-    final_model = SiameseLSTM(1, **best_params).to(device)
-    optimizer = optim.Adam(final_model.parameters(), lr=best_params["learning_rate"])
-    criterion = nn.BCELoss()
-
-    for epoch in range(15): 
-        final_model.train()
-        total_loss = 0
-        for before, after, label_batch in full_loader:
-            before, after, label_batch = before.to(device), after.to(device), label_batch.to(device)
-            optimizer.zero_grad()
-            outputs = final_model(before, after)
-            loss = criterion(outputs.squeeze(), label_batch)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-        print(f"Final Training Epoch {epoch+1}/15, Loss: {total_loss/len(full_loader):.4f}")
-
-    torch.save(final_model.state_dict(), os.path.join(model_directory_path, "model.pth"))
-    joblib.dump(scaler, os.path.join(model_directory_path, "scaler.joblib"))
-    joblib.dump(best_params, os.path.join(model_directory_path, "best_params.joblib"))
-    print("Training complete and final model saved.")
-
+    random_search = RandomizedSearchCV(
+        estimator = base_model,
+        param_distributions = param_dist,
+        n_iter = 50,
+        cv = 5,
+        verbose = 1,
+        random_state = 24,
+        n_jobs = -1,
+        scoring = 'roc_auc'
+    )
+    random_search.fit(X_train_features, y_train_aligned)
+    model = random_search.best_estimator_
+    joblib.dump(model, os.path.join(model_directory_path, 'model.joblib'))
+    joblib.dump(X_train_features.columns.tolist(), os.path.join(model_directory_path, 'feature_names.joblib'))
+    joblib.dump(imputer_values, os.path.join(model_directory_path, 'imputer_values.joblib'))
+    print("LightGBM model trained and saved.")
 
 def infer(
     X_test: typing.Iterable[pd.DataFrame],
     model_directory_path: str,
-) -> typing.Generator[float, None, None]:
-    
-    best_params = joblib.load(os.path.join(model_directory_path, "best_params.joblib"))
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    model = SiameseLSTM(input_size=1, **best_params)
-    model.load_state_dict(torch.load(os.path.join(model_directory_path, "model.pth")))
-    model.to(device)
-    model.eval()
-    
-    scaler = joblib.load(os.path.join(model_directory_path, "scaler.joblib"))
-    yield # Mark as ready
+):
+    model = joblib.load(os.path.join(model_directory_path, 'model.joblib'))
+    feature_names = joblib.load(os.path.join(model_directory_path, 'feature_names.joblib'))
+    imputer_values = joblib.load(os.path.join(model_directory_path, 'imputer_values.joblib'))
+
+    yield  # Mark as ready
 
     for dataset in X_test:
-        before_series = dataset[dataset['period'] == 0]['value'].values.reshape(-1, 1)
-        after_series = dataset[dataset['period'] == 1]['value'].values.reshape(-1, 1)
+        test_features_series = extract_features(dataset)
+        test_features = test_features_series.to_frame().T
         
-        before_scaled = scaler.transform(before_series)
-        after_scaled = scaler.transform(after_series)
+        # Align columns with the training data
+        for col in feature_names:
+            if col not in test_features.columns:
+                test_features[col] = imputer_values.get(col, 0) # Use imputer value for missing columns
+
+        test_features = test_features[feature_names]
+        test_features.fillna(imputer_values, inplace=True)
         
-        tensor_before = torch.tensor(before_scaled, dtype=torch.float32).unsqueeze(0).to(device)
-        tensor_after = torch.tensor(after_scaled, dtype=torch.float32).unsqueeze(0).to(device)
-        
-        with torch.no_grad():
-            prediction = model(tensor_before, tensor_after)
-            
-        yield prediction.item()
+        prediction = model.predict_proba(test_features)[:, 1][0]
+        yield prediction
